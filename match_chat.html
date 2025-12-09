@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Match Communication</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+/* QUAKE 1 THEME */
+body { background:#121621; color:#C0C0C0; font-family:'Courier New', monospace; padding:15px; display: flex; flex-direction: column; height: calc(100vh - 30px); margin: 0; }
+h3 { color: #FF9900; letter-spacing: 0.1em; border-bottom: 2px solid #555; padding-bottom: 5px; }
+#server-info { background:#0b0d12; border: 2px solid #555; padding: 10px; margin-bottom: 10px; font-weight: bold; }
+#chat-display { flex-grow: 1; overflow-y: scroll; background:#0b0d12; border: 1px solid #555; padding: 10px; margin-bottom: 10px; }
+#chat-input-area { display: flex; }
+#chatInput { flex-grow: 1; padding: 10px; background: #222; color: white; border: 1px solid #555; margin-right: 5px; }
+button { padding:10px 18px; font-weight:700; cursor:pointer; background:#555; color:white; border: 2px outset #C0C0C0; transition: background 0.1s; }
+.chat-message { margin-bottom: 5px; }
+.chat-message b { color: #00CC00; }
+.system-message { color: #FF0000; font-style: italic; }
+#action-area { display: flex; justify-content: space-between; margin-top: 10px; }
+#score-input { width: 150px; margin-right: 10px; }
+</style>
+</head>
+
+<body>
+  <h3 id="match-title"></h3>
+  <div id="server-info"></div>
+  <div id="chat-display"></div>
+  
+  <div id="active-tools">
+      <div id="chat-input-area">
+        <input id="chatInput" placeholder="Type your message...">
+        <button onclick="sendChat()">SEND</button>
+      </div>
+
+      <div id="action-area">
+          <div>
+              <label for="score-input">Submit Score (Enter **your** username to claim win):</label>
+              <input id="score-input" placeholder="Your Username">
+              <button onclick="submitScore()">Submit Win</button>
+          </div>
+          <button style="background:#800000;" onclick="closeMatch()">FORFEIT / CLOSE MATCH</button>
+      </div>
+  </div>
+
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+<script>
+// --- SUPABASE CREDENTIALS ---
+const SUPABASE_URL = "https://lnocxcxpufodlxurbsve.supabase.co"; 
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxub2N4Y3hwdWZvZGx4dXJic3ZlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjUyNzQzMTIsImV4cCI6MjA4MDg1MDMxMn0.1dbKp9q1XrGR56BkQZiXmpHYXTZvUkz0GLtDLy3D58Y";
+// ----------------------------
+
+const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// State derived from URL parameters
+const urlParams = new URLSearchParams(window.location.search);
+const matchId = urlParams.get('id');
+const matchIdentifier = urlParams.get('matchId');
+const game = urlParams.get('game');
+const serverIp = urlParams.get('ip');
+const username = decodeURIComponent(urlParams.get('user'));
+
+let currentMatchDbId = null; 
+
+document.addEventListener('DOMContentLoaded', () => {
+    currentMatchDbId = parseInt(matchId);
+    document.getElementById('match-title').textContent = `${matchIdentifier} (${game} Duel)`;
+    document.getElementById('server-info').textContent = `Server: ${serverIp}`;
+
+    // Start chat polling
+    setInterval(pollChat, 5000); 
+    pollChat(); 
+});
+
+// --- CHAT ACTIONS ---
+async function sendChat() {
+    const message = document.getElementById('chatInput').value.trim();
+    if (!message) return;
+
+    // 1. Send the chat message
+    await db.from('chat').insert({
+        match_id: currentMatchDbId,
+        username: username,
+        message: message,
+    });
+    
+    // 2. Update the match's last_activity timestamp (prevents timeout)
+    await db.from('matches')
+        .update({ last_activity: new Date().toISOString() })
+        .eq('id', currentMatchDbId);
+
+    document.getElementById('chatInput').value = '';
+    pollChat(); 
+}
+
+// --- SCORE SUBMISSION / FINALIZATION ---
+async function submitScore() {
+    const enteredUser = document.getElementById('score-input').value.trim();
+    
+    if (enteredUser.toLowerCase() !== username.toLowerCase()) {
+        alert("To claim victory, you must enter your own name exactly as it appears (or 'Anonymous').");
+        return;
+    }
+
+    const confirmSubmit = confirm(`Confirming victory for ${username}. This will close the match.`);
+    if (!confirmSubmit) return;
+
+    const { error } = await db.from('matches')
+        .update({ status: 'Completed', winner: username, last_activity: new Date().toISOString() })
+        .eq('id', currentMatchDbId)
+        .eq('status', 'Active'); 
+
+    if (error) {
+        alert("Error submitting score. Match may have already closed.");
+    } else {
+        alert(`Score submitted! Match ${matchIdentifier} is now closed.`);
+        pollChat(); 
+        // Tell the main page (index.html) to refresh history
+        if (window.opener && window.opener.poll) {
+            window.opener.poll(); 
+        }
+    }
+}
+
+async function closeMatch() {
+    const confirmForfeit = confirm(`Are you sure you want to close this match? This will count as a forfeit/closure.`);
+    if (!confirmForfeit) return;
+
+    const { error } = await db.from('matches')
+        .update({ status: 'Closed', winner: 'None (Forfeit/Closure)', last_activity: new Date().toISOString() })
+        .eq('id', currentMatchDbId)
+        .eq('status', 'Active');
+        
+    if (error) {
+        alert("Error closing match. It may have already timed out or been closed by the opponent.");
+    } else {
+        alert(`Match ${matchIdentifier} has been closed.`);
+        pollChat(); 
+        if (window.opener && window.opener.poll) {
+            window.opener.poll();
+        }
+    }
+}
+
+// --- CHAT POLLING ---
+async function pollChat() {
+    if (!currentMatchDbId) return;
+
+    // 1. Check if the match is still active
+    const { data: matchData } = await db.from('matches')
+        .select('status')
+        .eq('id', currentMatchDbId)
+        .single();
+        
+    const isActive = matchData && matchData.status === 'Active';
+
+    const toolsDiv = document.getElementById('active-tools');
+    const chatDiv = document.getElementById('chat-display');
+
+    if (!isActive) {
+        toolsDiv.style.display = 'none';
+        
+        let statusMessage = `--- MATCH IS ${matchData.status.toUpperCase()} ---`;
+        if (matchData.status === 'TimedOut') {
+            statusMessage = `--- MATCH TIMED OUT AFTER 20 MINUTES OF INACTIVITY ---`;
+        } else if (matchData.status === 'Completed') {
+            statusMessage = `--- MATCH COMPLETED! Winner was submitted. ---`;
+        }
+        
+        // Append the status message only if it's not already visible
+        if (!chatDiv.innerHTML.includes('--- MATCH')) {
+            chatDiv.innerHTML += `<div class="system-message">${statusMessage}</div>`;
+        }
+        return;
+    } else {
+        toolsDiv.style.display = 'block';
+    }
+
+
+    // 2. Fetch all chat messages
+    const { data: msgs } = await db.from('chat')
+        .select('username, message, created_at')
+        .eq('match_id', currentMatchDbId)
+        .order('created_at', { ascending: true });
+
+    const shouldScroll = chatDiv.scrollTop + chatDiv.clientHeight === chatDiv.scrollHeight;
+
+    chatDiv.innerHTML = msgs.map(m => 
+        `<div class="chat-message"><b>${m.username}</b>: ${m.message}</div>`
+    ).join('');
+
+    if (shouldScroll) {
+        chatDiv.scrollTop = chatDiv.scrollHeight;
+    }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>QUAKE ARENA MATCHMAKER</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+/* QUAKE 1 THEME: Orange/Black/Grey */
+body { background:#121621; color:#C0C0C0; font-family:'Courier New', monospace; padding:20px; }
+h1, h3 { color: #FF9900; letter-spacing: 0.1em; text-shadow: 1px 1px #000; border-bottom: 2px solid #555; padding-bottom: 5px; }
+section { background:#0b0d12; border: 2px solid #555; border-radius:4px; padding:15px; margin-bottom:20px; }
+button { padding:10px 18px; font-weight:700; cursor:pointer; background:#555; color:white; border: 2px outset #C0C0C0; transition: background 0.1s; }
+button:hover { background:#777; }
+input, select { padding:8px; margin:6px 0; width:100%; background:#222; color:white; border: 1px solid #555; }
+.match { background:#1a2030; padding:10px; border-radius:4px; margin-bottom:6px; cursor:pointer; border-left: 5px solid #FF9900; }
+.match:hover { background:#2a3040; }
+#queue-status { margin-top: 10px; font-weight: bold; color: #FF9900; }
+.match-active { color: #00CC00; }
+.match-history { color: #C0C0C0; }
+.match-timedout { color: #FF0000; }
+</style>
+</head>
+
+<body>
+<h1>QUAKE ARENA MATCHMAKER</h1>
+
+<section id="queue-section">
+  <input id="username" placeholder="Anonymous Player Name">
+  <select id="games" multiple size="6">
+    <option value="QuakeWorld">QuakeWorld</option>
+    <option value="Quake 2">Quake 2</option>
+    <option value="Quake 3">Quake 3</option>
+    <option value="Quake Live">Quake Live</option>
+    <option value="Quake 4">Quake 4</option>
+    <option value="Quake Champions">Quake Champions</option>
+    <option value="Reflex Arena">Reflex Arena</option>
+    <option value="Warfork">Warfork</option>
+    <option value="Open Arena">Open Arena</option>
+    <option value="Xonotic">Xonotic</option>
+    <option value="Unreal Tournament">Unreal Tournament</option>
+    <option value="Unreal Tournament 2004">Unreal Tournament 2004</option>
+    <option value="Half-life">Half-life</option>
+    <option value="Half-life 2">Half-life 2</option>
+  </select>
+  <p style="font-size:0.8em; color:#777;">Hold CTRL or CMD to select multiple games. Mode is always Duel.</p>
+  <button onclick="joinQueue()">Join Match Queue</button>
+  <div id="queue-status">Not currently queued.</div>
+</section>
+
+<section>
+  <h3>ACTIVE MATCHES (<span id="queue-count">0</span> In Queue)</h3>
+  <div id="active-matches">None.</div>
+</section>
+
+<section>
+  <h3>MATCH HISTORY</h3>
+  <div id="history-matches">None.</div>
+</section>
+
+<script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+<script>
+// --- SUPABASE CREDENTIALS ---
+const SUPABASE_URL = "https://lnocxcxpufodlxurbsve.supabase.co"; 
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxub2N4Y3hwdWZvZGx4dXJic3ZlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjUyNzQzMTIsImV4cCI6MjA4MDg1MDMxMn0.1dbKp9q1XrGR56BkQZiXmpHYXTZvUkz0GLtDLy3D58Y";
+// ----------------------------
+
+const MATCHMAKER_URL = `${SUPABASE_URL}/functions/v1/matchmaker`; 
+const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+const sessionId = localStorage.sessionId ||= crypto.randomUUID();
+let currentMatchId = null;
+let queueCheckActive = false;
+
+document.addEventListener('DOMContentLoaded', initialCheck);
+
+// --- STATE CHECK ON LOAD (FIXED LOGIC) ---
+async function initialCheck() {
+    const usernameInput = document.getElementById('username');
+    usernameInput.value = localStorage.username || '';
+    
+    // Check if the current session ID is still in the queue table
+    const { data: queueData, error: queueError } = await db.from('queue').select('id').eq('session_id', sessionId).limit(1);
+
+    // If there's an error or no queue data, assume not in queue.
+    if (queueError || queueData.length === 0) {
+        queueCheckActive = false;
+        document.getElementById('queue-status').innerHTML = 'Not currently queued.';
+        // IMPORTANT FIX: If they aren't in the queue, clear any existing match player record
+        currentMatchId = null;
+        await db.from('match_players').delete().eq('session_id', sessionId);
+    } else {
+        // If they are in the queue, update state
+        queueCheckActive = true;
+        document.getElementById('queue-status').innerHTML = '<span class="match-active">In Queue. Polling for Match...</span>';
+    }
+
+    // Check for an active match using the match_players table
+    const { data: activeMatchData } = await db.from('match_players').select('match_id').eq('session_id', sessionId).limit(1).single();
+    if (activeMatchData) {
+        currentMatchId = activeMatchData.match_id;
+    }
+
+    // Start polling loop
+    setInterval(poll, 3000); 
+    poll(); 
+}
+
+// --- JOIN QUEUE (FIXED LOGIC) ---
+async function joinQueue() {
+    if (queueCheckActive) return;
+
+    const username = document.getElementById('username').value || 'Anonymous';
+    const gamesElement = document.getElementById('games');
+    const selectedGames = Array.from(gamesElement.selectedOptions).map(option => option.value);
+
+    if (selectedGames.length === 0) {
+        alert("Please select at least one game.");
+        return;
+    }
+    
+    localStorage.username = username;
+
+    const { error: insertError } = await db.from('queue').insert({
+        session_id: sessionId,
+        username: username,
+        games_list: selectedGames,
+    });
+    
+    if (insertError) {
+        alert("Error joining queue: " + insertError.message);
+        return;
+    }
+
+    queueCheckActive = true;
+    document.getElementById('queue-status').innerHTML = `<span class="match-active">In Queue for: ${selectedGames.join(', ')}.</span>`;
+    
+    // CRUCIAL FIX: Immediately check for a match after inserting
+    await checkMatch(); 
+    
+    // Refresh the overall page status
+    poll();
+}
+
+// --- CORE POLLING FUNCTION ---
+async function poll() {
+    // 1. Check for Match (Secure Server Call)
+    if (queueCheckActive && !currentMatchId) {
+        await checkMatch();
+    }
+    
+    // 2. Refresh Match Displays
+    await displayMatches();
+    
+    // 3. Update Queue Count (Using robust count method)
+    // NOTE: This relies on the 'Allow anon to select queue' RLS policy being present.
+    const { count: queueCount } = await db.from('queue').select('*', { count: 'exact', head: true });
+    document.getElementById('queue-count').textContent = queueCount || 0;
+}
+
+// Calls the secure Edge Function to perform matchmaking logic
+async function checkMatch() {
+    const username = document.getElementById('username').value || 'Anonymous';
+
+    try {
+        const response = await fetch(MATCHMAKER_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                session_id: sessionId,
+                username: username,
+                is_join_request: true 
+            })
+        });
+        
+        const result = await response.json();
+
+        if (result.error) {
+            console.error("Matchmaker Error:", result.error);
+            return;
+        }
+
+        if (result.match) {
+            // MATCH FOUND!
+            queueCheckActive = false;
+            currentMatchId = result.match.id;
+            document.getElementById('queue-status').innerHTML = `<span class="match-active">MATCH FOUND! Opening Chat...</span>`;
+            openMatchWindow(result.match.id, result.match.match_id, result.match.game, result.match.server_ip);
+        }
+    } catch (e) {
+        console.error("Network or Fetch Error:", e);
+    }
+}
+
+// --- DISPLAY LOGIC ---
+async function displayMatches() {
+    const { data: allMatches } = await db.from('matches').select('*').order('created_at', { ascending: false });
+
+    if (!allMatches) return;
+
+    const activeHtml = [];
+    const historyHtml = [];
+
+    allMatches.forEach(m => {
+        const playerNames = m.players_json.map(p => p.username).join(' vs ');
+        
+        let statusClass = 'match-history';
+        if (m.status === 'Active') statusClass = 'match-active';
+        else if (m.status === 'TimedOut') statusClass = 'match-timedout';
+        
+        const html = `<div class="match ${statusClass}" onclick="openMatchWindow('${m.id}', '${m.match_id}', '${m.game}', '${m.server_ip}', '${m.status}')">
+            <strong>[${m.match_id}] ${m.game}</strong> | ${playerNames} (Status: ${m.status}${m.winner ? ` Winner: ${m.winner}` : ''})
+        </div>`;
+        
+        if (m.status === 'Active') {
+            activeHtml.push(html);
+        } else {
+            historyHtml.push(html);
+        }
+        
+        // If the player is in an active match, ensure the window is open
+        if (currentMatchId === m.id && m.status === 'Active' && window.matchChatWindow && !window.matchChatWindow.closed) {
+             // Window is already open, do nothing
+        } else if (currentMatchId === m.id && m.status === 'Active') {
+            // Player is in this match, but the window is closed/not created, re-open it
+            openMatchWindow(m.id, m.match_id, m.game, m.server_ip, m.status);
+        }
+    });
+
+    document.getElementById('active-matches').innerHTML = activeHtml.length ? activeHtml.join('') : 'None.';
+    document.getElementById('history-matches').innerHTML = historyHtml.length ? historyHtml.join('') : 'None.';
+}
+
+// --- WINDOW HANDLING ---
+function openMatchWindow(id, matchId, game, serverIp, status) {
+    const username = localStorage.username || 'Anonymous';
+    const url = `match_chat.html?id=${id}&matchId=${matchId}&game=${game}&ip=${serverIp}&user=${encodeURIComponent(username)}&status=${status}`;
+    
+    // Check if the window is already open to avoid multiple pop-ups
+    if (window.matchChatWindow && !window.matchChatWindow.closed) {
+        window.matchChatWindow.focus();
+    } else {
+        // Store the window reference globally
+        window.matchChatWindow = window.open(url, `match_${id}`, 'width=800,height=600,scrollbars=yes');
+    }
+}
+</script>
+</body>
+</html>
