@@ -26,10 +26,10 @@ input, select { padding:8px; margin:6px 0; width:100%; background:#222; color:wh
 
 <section id="queue-section">
   <input id="username" placeholder="Anonymous Player Name">
-  <select id="games" multiple size="6">
+  <select id="games">
     <option value="QuakeWorld">QuakeWorld</option>
     <option value="Quake 2">Quake 2</option>
-    <option value="Quake 3">Quake 3</option>
+    <option value="Quake 3" selected>Quake 3</option>
     <option value="Quake Live">Quake Live</option>
     <option value="Quake 4">Quake 4</option>
     <option value="Quake Champions">Quake Champions</option>
@@ -42,7 +42,7 @@ input, select { padding:8px; margin:6px 0; width:100%; background:#222; color:wh
     <option value="Half-life">Half-life</option>
     <option value="Half-life 2">Half-life 2</option>
   </select>
-  <p style="font-size:0.8em; color:#777;">Hold CTRL or CMD to select multiple games. Mode is always Duel.</p>
+  <p style="font-size:0.8em; color:#777;">Mode is always Duel (Select a single game).</p>
   <button onclick="joinQueue()">Join Match Queue</button>
   <div id="queue-status">Not currently queued.</div>
 </section>
@@ -105,16 +105,17 @@ async function initialCheck() {
     poll(); 
 }
 
-// --- JOIN QUEUE (FIXED LOGIC) ---
+// --- JOIN QUEUE (FIXED LOGIC for single select) ---
 async function joinQueue() {
     if (queueCheckActive) return;
 
     const username = document.getElementById('username').value || 'Anonymous';
     const gamesElement = document.getElementById('games');
-    const selectedGames = Array.from(gamesElement.selectedOptions).map(option => option.value);
+    // Change: Get single selected value, wrap in array for database consistency
+    const selectedGame = gamesElement.value; 
 
-    if (selectedGames.length === 0) {
-        alert("Please select at least one game.");
+    if (!selectedGame) {
+        alert("Please select a game.");
         return;
     }
     
@@ -123,7 +124,8 @@ async function joinQueue() {
     const { error: insertError } = await db.from('queue').insert({
         session_id: sessionId,
         username: username,
-        games_list: selectedGames,
+        // The database expects a text array, so we still pass a single-item array.
+        games_list: [selectedGame], 
     });
     
     if (insertError) {
@@ -132,7 +134,7 @@ async function joinQueue() {
     }
 
     queueCheckActive = true;
-    document.getElementById('queue-status').innerHTML = `<span class="match-active">In Queue for: ${selectedGames.join(', ')}.</span>`;
+    document.getElementById('queue-status').innerHTML = `<span class="match-active">In Queue for: ${selectedGame}.</span>`;
     
     // CRUCIAL FIX: Immediately check for a match after inserting
     await checkMatch(); 
@@ -152,7 +154,6 @@ async function poll() {
     await displayMatches();
     
     // 3. Update Queue Count (Using robust count method)
-    // NOTE: This relies on the 'Allow anon to select queue' RLS policy being present.
     const { count: queueCount } = await db.from('queue').select('*', { count: 'exact', head: true });
     document.getElementById('queue-count').textContent = queueCount || 0;
 }
