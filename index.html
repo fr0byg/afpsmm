@@ -71,47 +71,100 @@ const sessionId = localStorage.sessionId ||= crypto.randomUUID();
 let currentMatchId = null;
 let queueCheckActive = false;
 
-document.addEventListener('DOMContentLoaded', initialCheck);
+document.addEventListener('DOMContentLoaded', initialSetup);
 
-// --- STATE CHECK ON LOAD (FIXED LOGIC) ---
-async function initialCheck() {
+// --- 1. INITIAL SETUP AND REALTIME SUBSCRIPTIONS ---
+async function initialSetup() {
     const usernameInput = document.getElementById('username');
     usernameInput.value = localStorage.username || '';
     
-    // Check if the current session ID is still in the queue table
-    const { data: queueData, error: queueError } = await db.from('queue').select('id').eq('session_id', sessionId).limit(1);
-
-    // If there's an error or no queue data, assume not in queue.
-    if (queueError || queueData.length === 0) {
-        queueCheckActive = false;
-        document.getElementById('queue-status').innerHTML = 'Not currently queued.';
-        // IMPORTANT FIX: If they aren't in the queue, clear any existing match player record
-        currentMatchId = null;
-        await db.from('match_players').delete().eq('session_id', sessionId);
-    } else {
-        // If they are in the queue, update state
-        queueCheckActive = true;
-        document.getElementById('queue-status').innerHTML = '<span class="match-active">In Queue. Polling for Match...</span>';
-    }
-
-    // Check for an active match using the match_players table
-    const { data: activeMatchData } = await db.from('match_players').select('match_id').eq('session_id', sessionId).limit(1).single();
-    if (activeMatchData) {
-        currentMatchId = activeMatchData.match_id;
-    }
-
-    // Start polling loop
-    setInterval(poll, 3000); 
-    poll(); 
+    // Check initial state 
+    await checkPlayerState(); 
+    
+    // Set up Realtime listeners for instant updates
+    subscribeToQueueUpdates();
+    subscribeToMatchUpdates();
+    
+    // Initial display of matches and queue count
+    await displayMatches();
+    await updateQueueCount();
 }
 
-// --- JOIN QUEUE (FIXED LOGIC for single select) ---
+// Check if the current session is in the queue or an active match
+async function checkPlayerState() {
+    const { data: queueData } = await db.from('queue').select('id').eq('session_id', sessionId).limit(1);
+    const { data: activeMatchData } = await db.from('match_players').select('match_id').eq('session_id', sessionId).limit(1).single();
+
+    if (queueData.length > 0) {
+        queueCheckActive = true;
+        document.getElementById('queue-status').innerHTML = '<span class="match-active">In Queue. Waiting for Match...</span>';
+    } else if (activeMatchData) {
+        currentMatchId = activeMatchData.match_id;
+        document.getElementById('queue-status').innerHTML = '<span class="match-active">In Active Match.</span>';
+    } else {
+        queueCheckActive = false;
+        currentMatchId = null;
+        document.getElementById('queue-status').innerHTML = 'Not currently queued.';
+    }
+}
+
+// --- 2. REALTIME SUBSCRIPTIONS ---
+
+// Subscribes to changes in the 'queue' table for the instant count update
+function subscribeToQueueUpdates() {
+    db.channel('public:queue')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'queue' }, async (payload) => {
+        // Any insert/delete/update in the queue table will instantly trigger a count update
+        await updateQueueCount(); 
+      })
+      .subscribe();
+}
+
+// Subscribes to changes in the 'matches' and 'match_players' tables
+function subscribeToMatchUpdates() {
+    // 2a. Watch for updates in the match_players table (which means a match was created/deleted)
+    db.channel('public:match_players')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'match_players' }, async (payload) => {
+        // On ANY change to match_players, re-check our state and refresh the display
+        await checkPlayerState();
+        await displayMatches();
+      })
+      .subscribe();
+      
+    // 2b. Watch for new matches created (or status changes)
+    db.channel('public:matches')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'matches' }, async (payload) => {
+        await displayMatches();
+        
+        // Match Found Logic: If a row was INSERTED AND includes our session_id (meaning we are P1 or P2)
+        if (payload.eventType === 'INSERT' && 
+            (payload.new.players_json.some(p => p.session_id === sessionId))) {
+            
+            // This is the POPUP TRIGGER
+            currentMatchId = payload.new.id;
+            queueCheckActive = false;
+            document.getElementById('queue-status').innerHTML = `<span class="match-active">MATCH FOUND! Opening Chat...</span>`;
+            openMatchWindow(payload.new.id, payload.new.match_id, payload.new.game, payload.new.server_ip);
+        }
+      })
+      .subscribe();
+}
+
+
+// --- 3. HELPER FUNCTIONS ---
+
+// Function to update the queue count (called by the Realtime listener)
+async function updateQueueCount() {
+    const { count: queueCount } = await db.from('queue').select('*', { count: 'exact', head: true });
+    document.getElementById('queue-count').textContent = queueCount || 0;
+}
+
+// --- JOIN QUEUE (Uses single-select logic) ---
 async function joinQueue() {
     if (queueCheckActive) return;
 
     const username = document.getElementById('username').value || 'Anonymous';
     const gamesElement = document.getElementById('games');
-    // Change: Get single selected value, wrap in array for database consistency
     const selectedGame = gamesElement.value; 
 
     if (!selectedGame) {
@@ -136,26 +189,8 @@ async function joinQueue() {
     queueCheckActive = true;
     document.getElementById('queue-status').innerHTML = `<span class="match-active">In Queue for: ${selectedGame}.</span>`;
     
-    // CRUCIAL FIX: Immediately check for a match after inserting
+    // CRUCIAL: Immediately call the Edge Function to check for a match
     await checkMatch(); 
-    
-    // Refresh the overall page status
-    poll();
-}
-
-// --- CORE POLLING FUNCTION ---
-async function poll() {
-    // 1. Check for Match (Secure Server Call)
-    if (queueCheckActive && !currentMatchId) {
-        await checkMatch();
-    }
-    
-    // 2. Refresh Match Displays
-    await displayMatches();
-    
-    // 3. Update Queue Count (Using robust count method)
-    const { count: queueCount } = await db.from('queue').select('*', { count: 'exact', head: true });
-    document.getElementById('queue-count').textContent = queueCount || 0;
 }
 
 // Calls the secure Edge Function to perform matchmaking logic
@@ -173,20 +208,12 @@ async function checkMatch() {
             })
         });
         
-        const result = await response.json();
-
-        if (result.error) {
-            console.error("Matchmaker Error:", result.error);
-            return;
+        // The pop-up is handled by the Realtime subscription; this just ensures the server logic runs.
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error("Matchmaker Function Error:", errorText);
         }
-
-        if (result.match) {
-            // MATCH FOUND!
-            queueCheckActive = false;
-            currentMatchId = result.match.id;
-            document.getElementById('queue-status').innerHTML = `<span class="match-active">MATCH FOUND! Opening Chat...</span>`;
-            openMatchWindow(result.match.id, result.match.match_id, result.match.game, result.match.server_ip);
-        }
+        
     } catch (e) {
         console.error("Network or Fetch Error:", e);
     }
@@ -218,11 +245,8 @@ async function displayMatches() {
             historyHtml.push(html);
         }
         
-        // If the player is in an active match, ensure the window is open
-        if (currentMatchId === m.id && m.status === 'Active' && window.matchChatWindow && !window.matchChatWindow.closed) {
-             // Window is already open, do nothing
-        } else if (currentMatchId === m.id && m.status === 'Active') {
-            // Player is in this match, but the window is closed/not created, re-open it
+        // This logic ensures the chat window stays open if the match is active
+        if (currentMatchId === m.id && m.status === 'Active' && (!window.matchChatWindow || window.matchChatWindow.closed)) {
             openMatchWindow(m.id, m.match_id, m.game, m.server_ip, m.status);
         }
     });
